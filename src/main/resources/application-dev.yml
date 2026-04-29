@@ -1,0 +1,21 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# application-dev.yml — active when SPRING_PROFILES_ACTIVE=dev
+# Use for local single-node development (no etcd needed)
+# ─────────────────────────────────────────────────────────────────────────────
+
+spring:
+  jpa:
+    show-sql: true
+  flyway:
+    baseline-on-migrate: true   # safe to run against an existing DB in dev
+
+scheduler:
+  poll-interval-ms: 2000        # faster poll cycle for dev feedback
+  leader:
+    backend: redis-lock         # skip etcd in single-node local dev
+
+logging:
+  level:
+    com.jobscheduler: DEBUG
+    org.hibernate.SQL: INFO
+    org.hibernate.orm.jdbc.bind: INFO

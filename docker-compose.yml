@@ -1,0 +1,160 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Distributed Job Scheduler — local multi-node cluster
+#
+# Start everything:  docker compose up --build
+# Kill a scheduler:  docker kill job-scheduler-scheduler-1-1
+# Watch takeover:    docker logs -f job-scheduler-scheduler-2-1
+# Grafana:           http://localhost:3000  (admin / admin)
+# Prometheus:        http://localhost:9090
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Infrastructure ───────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: js-postgres
+    environment:
+      POSTGRES_DB: jobscheduler
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: secret
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d jobscheduler"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - js-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: js-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - js-net
+
+  etcd:
+    image: bitnami/etcd:3.5
+    container_name: js-etcd
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+    ports:
+      - "2379:2379"
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - js-net
+
+  # ── Application — Schedulers (HA pair) ───────────────────────────────────────
+
+  scheduler-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: js-scheduler-1
+    environment:
+      NODE_ID: scheduler-1
+      SPRING_PROFILES_ACTIVE: scheduler,worker
+      DB_HOST: postgres
+      REDIS_HOST: redis
+      ETCD_ENDPOINTS: http://etcd:2379
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      etcd:     { condition: service_healthy }
+    ports:
+      - "8080:8080"
+    networks:
+      - js-net
+
+  scheduler-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: js-scheduler-2
+    environment:
+      NODE_ID: scheduler-2
+      SPRING_PROFILES_ACTIVE: scheduler,worker
+      DB_HOST: postgres
+      REDIS_HOST: redis
+      ETCD_ENDPOINTS: http://etcd:2379
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      etcd:     { condition: service_healthy }
+    ports:
+      - "8081:8080"
+    networks:
+      - js-net
+
+  # ── Application — Additional Workers ─────────────────────────────────────────
+
+  worker-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: js-worker-3
+    environment:
+      NODE_ID: worker-3
+      SPRING_PROFILES_ACTIVE: worker
+      DB_HOST: postgres
+      REDIS_HOST: redis
+      ETCD_ENDPOINTS: http://etcd:2379
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    ports:
+      - "8082:8080"
+    networks:
+      - js-net
+
+  # ── Observability ─────────────────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: js-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - js-net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: js-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - js-net
+
+volumes:
+  postgres_data:
+  grafana_data:
+
+networks:
+  js-net:
+    driver: bridge

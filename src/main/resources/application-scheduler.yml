@@ -1,0 +1,15 @@
+# application-scheduler.yml
+# Active when SPRING_PROFILES_ACTIVE includes "scheduler"
+# In monolith phase: combine with worker → "scheduler,worker"
+# In microservices phase: run standalone on 2-pod HA deployment
+
+scheduler:
+  poll-interval-ms: 5000
+  dispatch-batch-size: 50
+  leader:
+    backend: etcd
+    lease-ttl-seconds: 15
+
+logging:
+  level:
+    com.jobscheduler.scheduler: DEBUG

@@ -1,0 +1,13 @@
+# application-worker.yml
+# Active when SPRING_PROFILES_ACTIVE includes "worker"
+# In monolith phase: SPRING_PROFILES_ACTIVE=scheduler,worker
+
+scheduler:
+  worker:
+    concurrency: 5
+  heartbeat-interval-ms: 10000
+  stale-worker-threshold-seconds: 30
+
+logging:
+  level:
+    com.jobscheduler.worker: DEBUG

@@ -1,0 +1,81 @@
+{
+  "title": "Job Scheduler Dashboard",
+  "panels": [
+    {
+      "title": "Jobs Submitted / min",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [{
+        "expr": "round(rate(jobs_submitted_total[1m]) * 60, 0.01)",
+        "legendFormat": "submitted/min"
+      }]
+    },
+    {
+      "title": "Jobs Completed / min",
+      "type": "stat",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "targets": [{
+        "expr": "round(rate(jobs_completed_total[1m]) * 60, 0.01)",
+        "legendFormat": "completed/min"
+      }]
+    },
+    {
+      "title": "Jobs Failed / min",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "targets": [{
+        "expr": "round(rate(jobs_failed_total[1m]) * 60, 0.01)",
+        "legendFormat": "failed/min"
+      }]
+    },
+    {
+      "title": "Dead Letter Queue",
+      "type": "stat",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "targets": [{
+        "expr": "sum(jobs_dead_letter_total) or vector(0)",
+        "legendFormat": "dead letters"
+      }]
+    },
+    {
+      "title": "Queue Depth",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "jobs_pending_count", "legendFormat": "PENDING" },
+        { "expr": "jobs_running_count", "legendFormat": "RUNNING" }
+      ]
+    },
+    {
+      "title": "Throughput (jobs/min)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(jobs_submitted_total[1m]) * 60", "legendFormat": "submitted" },
+        { "expr": "rate(jobs_completed_total[1m]) * 60", "legendFormat": "completed" },
+        { "expr": "rate(jobs_failed_total[1m]) * 60", "legendFormat": "failed" }
+      ]
+    },
+    {
+      "title": "Execution Latency (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(job_execution_duration_seconds_bucket[5m])) * 1000", "legendFormat": "p50 ms" },
+        { "expr": "histogram_quantile(0.95, rate(job_execution_duration_seconds_bucket[5m])) * 1000", "legendFormat": "p95 ms" },
+        { "expr": "histogram_quantile(0.99, rate(job_execution_duration_seconds_bucket[5m])) * 1000", "legendFormat": "p99 ms" }
+      ]
+    },
+    {
+      "title": "Error Rate %",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+      "targets": [{
+        "expr": "100 * rate(jobs_failed_total[5m]) / (rate(jobs_submitted_total[5m]) + 0.001)",
+        "legendFormat": "error rate %"
+      }]
+    }
+  ],
+  "time": { "from": "now-30m", "to": "now" },
+  "refresh": "10s"
+}

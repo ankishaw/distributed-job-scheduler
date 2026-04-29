@@ -1,0 +1,100 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# job-scheduler — base configuration
+# Profile overrides: application-dev.yml, application-scheduler.yml,
+#                    application-worker.yml
+# ─────────────────────────────────────────────────────────────────────────────
+
+spring:
+
+  application:
+    name: job-scheduler
+
+  # ── DataSource (Postgres) ──────────────────────────────────────────────────
+  datasource:
+    url: jdbc:postgresql://localhost:5432/jobscheduler
+    username: postgres
+    password: secret
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 30000
+
+  # ── JPA / Hibernate ────────────────────────────────────────────────────────
+  jpa:
+    hibernate:
+      # Flyway owns the schema — Hibernate must not touch DDL
+      ddl-auto: validate
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: false
+        jdbc:
+          # Enables @JdbcTypeCode(SqlTypes.JSON) for jsonb payload column
+          time_zone: UTC
+
+  # ── Flyway ─────────────────────────────────────────────────────────────────
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false    # set true in dev profile only
+
+  # ── Redis (Lettuce) ────────────────────────────────────────────────────────
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+
+  # ── Lifecycle: give in-flight jobs 30s to finish on shutdown ───────────────
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+# ── Actuator ─────────────────────────────────────────────────────────────────
+management:
+  endpoints:
+    web:
+      exposure:
+        # Expose only what Prometheus and health checks need
+        include: health, prometheus, info
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      # All metrics carry app and env labels — useful in Grafana filters
+      application: ${spring.application.name}
+      environment: ${APP_ENV:local}
+
+# ── Application-specific properties ──────────────────────────────────────────
+scheduler:
+  poll-interval-ms: 5000
+  dispatch-batch-size: 50
+  stale-worker-threshold-seconds: 30
+  heartbeat-interval-ms: 10000
+  worker:
+    concurrency: 5
+  leader:
+    backend: etcd           # switch to "redis-lock" in dev profile
+    lease-ttl-seconds: 15
+
+# ── etcd ─────────────────────────────────────────────────────────────────────
+etcd:
+  endpoints: ${ETCD_ENDPOINTS:http://localhost:2379}
+
+# ── Redisson (Redis-based Redlock fallback) ───────────────────────────────────
+redisson:
+  single-server-config:
+    address: "redis://${REDIS_HOST:localhost}:${REDIS_PORT:6379}"
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging:
+  level:
+    root: INFO
+    com.jobscheduler: INFO
+  pattern:
+    console: "%d{HH:mm:ss.SSS} [%thread] %-5level [%X{jobId}] %logger{36} - %msg%n"

@@ -1,0 +1,10 @@
+target/
+*.class
+*.jar
+!**/src/main/**
+!**/src/test/**
+.idea/
+*.iml
+*.iws
+.DS_Store
+.env
