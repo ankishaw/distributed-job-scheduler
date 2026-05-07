@@ -4,6 +4,7 @@ import com.jobscheduler.config.AppProperties;
 import com.jobscheduler.domain.model.Job;
 import com.jobscheduler.domain.model.JobStatus;
 import com.jobscheduler.domain.repository.JobRepository;
+import com.jobscheduler.leader.LeaderElectionService;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
@@ -20,43 +21,30 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * The scheduling brain of the system.
+ * Scheduling brain — only runs on the elected leader node.
  *
- * Runs on a fixed poll interval (default 5s). On each tick:
- *
- * 1. CRON RESCHEDULER — finds completed recurring jobs and
- *    resets them to PENDING with the next computed run time.
- *    This is what makes cron jobs repeat automatically.
- *
- * 2. DELAYED JOB ACTIVATOR — finds any PENDING one-shot jobs
- *    whose next_run_at is now in the past (edge case: jobs submitted
- *    while no workers were running). Workers handle this naturally
- *    via the SKIP LOCKED query, so this is a safety net.
- *
- * 3. ANTI-STARVATION — promotes LOW priority jobs that have been
- *    waiting longer than 5 minutes.
- *
- * In Phase 3 (leader election), this loop will be guarded by
- * leaderElectionSvc.isLeader() so only one node runs it.
- * For now (monolith phase), it runs on every instance.
+ * LEADER GUARD: tick() returns immediately if this node is not the leader.
+ * This prevents duplicate cron dispatch across multiple scheduler instances.
  */
 @Component
 public class SchedulerLoop {
 
     private static final Logger log = LoggerFactory.getLogger(SchedulerLoop.class);
 
-    private final AppProperties appProperties;
-    private final JobRepository jobRepository;
+    private final AppProperties           appProperties;
+    private final JobRepository           jobRepository;
     private final CronExpressionEvaluator cronEvaluator;
-
-    private ScheduledExecutorService scheduler;
+    private final LeaderElectionService   leaderElectionService;
+    private ScheduledExecutorService      scheduler;
 
     public SchedulerLoop(AppProperties appProperties,
                          JobRepository jobRepository,
-                         CronExpressionEvaluator cronEvaluator) {
-        this.appProperties = appProperties;
-        this.jobRepository  = jobRepository;
-        this.cronEvaluator  = cronEvaluator;
+                         CronExpressionEvaluator cronEvaluator,
+                         LeaderElectionService leaderElectionService) {
+        this.appProperties         = appProperties;
+        this.jobRepository         = jobRepository;
+        this.cronEvaluator         = cronEvaluator;
+        this.leaderElectionService = leaderElectionService;
     }
 
     @PostConstruct
@@ -66,15 +54,8 @@ public class SchedulerLoop {
             t.setDaemon(false);
             return t;
         });
-
         long intervalMs = appProperties.getPollIntervalMs();
-        scheduler.scheduleWithFixedDelay(
-            this::tick,
-            intervalMs,   // initial delay — let app fully start first
-            intervalMs,   // between ticks
-            TimeUnit.MILLISECONDS
-        );
-
+        scheduler.scheduleWithFixedDelay(this::tick, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
         log.info("SchedulerLoop started — polling every {}ms", intervalMs);
     }
 
@@ -82,76 +63,50 @@ public class SchedulerLoop {
     public void stop() {
         log.info("SchedulerLoop shutting down");
         scheduler.shutdown();
-        try {
-            scheduler.awaitTermination(10, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        try { scheduler.awaitTermination(10, TimeUnit.SECONDS); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
-    // ── Main tick ─────────────────────────────────────────────────────────────
-
-    /**
-     * Called every pollIntervalMs. Handles all scheduling concerns.
-     * Errors are caught so one bad tick never stops the loop.
-     */
     @Transactional
-    void tick() {
+    public void tick() {
+        // ── LEADER GUARD ──────────────────────────────────────────────────────
+        // Only the elected leader runs this logic.
+        // Non-leaders skip entirely — no cron dispatch, no priority bumps.
+        if (!leaderElectionService.isLeader()) {
+            log.trace("Node {} is not leader — skipping tick", leaderElectionService.getNodeId());
+            return;
+        }
+
         try {
             rescheduleCronJobs();
             promoteStaleJobs();
-            logQueueStats();
         } catch (Exception e) {
             log.error("Error during scheduler tick — will retry next interval", e);
         }
     }
 
-    // ── Cron rescheduler ──────────────────────────────────────────────────────
-
-    /**
-     * Find recurring (cron) jobs that have just COMPLETED and
-     * schedule their next execution.
-     *
-     * This is the core of recurring job support:
-     *   Job completes → SchedulerLoop finds it → computes nextRunAt
-     *   → resets to PENDING → worker picks it up at the right time
-     */
-
     void rescheduleCronJobs() {
-        // Find completed cron jobs (have a cronExpression, status=COMPLETED)
-        List<Job> completedCronJobs = jobRepository
+        List<Job> jobs = jobRepository
             .findCompletedCronJobs(PageRequest.of(0, appProperties.getDispatchBatchSize()))
             .getContent();
 
-        if (completedCronJobs.isEmpty()) return;
+        if (jobs.isEmpty()) return;
 
-        log.debug("Rescheduling {} completed cron jobs", completedCronJobs.size());
+        log.debug("Leader {}: rescheduling {} cron jobs", leaderElectionService.getNodeId(), jobs.size());
 
-        for (Job job : completedCronJobs) {
+        for (Job job : jobs) {
             cronEvaluator.nextRunAfter(job.getCronExpression(), ZonedDateTime.now())
-                .ifPresentOrElse(
-                    nextRun -> {
-                        job.setStatus(JobStatus.PENDING);
-                        job.setNextRunAt(nextRun);
-                        job.setRetryCount(0);
-                        job.setErrorMessage(null);
-                        job.setWorkerId(null);
-                        jobRepository.save(job);
-                        log.info("Cron job '{}' ({}) rescheduled → next run at {}",
-                            job.getName(), job.getId(), nextRun);
-                    },
-                    () -> log.warn("Cron job '{}' has no future execution — leaving COMPLETED",
-                        job.getName())
-                );
+                .ifPresentOrElse(nextRun -> {
+                    job.setStatus(JobStatus.PENDING);
+                    job.setNextRunAt(nextRun);
+                    job.setRetryCount(0);
+                    job.setErrorMessage(null);
+                    job.setWorkerId(null);
+                    jobRepository.save(job);
+                    log.info("Cron job '{}' rescheduled → next run at {}", job.getName(), nextRun);
+                }, () -> log.warn("Cron job '{}' has no future execution", job.getName()));
         }
     }
-
-    // ── Anti-starvation ───────────────────────────────────────────────────────
-
-    /**
-     * Promote LOW priority jobs waiting more than 5 minutes.
-     * Prevents CRITICAL jobs from starving LOW jobs indefinitely.
-     */
 
     void promoteStaleJobs() {
         Instant fiveMinutesAgo = Instant.now().minusSeconds(300);
@@ -159,12 +114,5 @@ public class SchedulerLoop {
         if (promoted > 0) {
             log.info("Anti-starvation: promoted {} jobs waiting >5 minutes", promoted);
         }
-    }
-
-    // ── Stats logging ─────────────────────────────────────────────────────────
-
-    void logQueueStats() {
-        // Logged at TRACE — only visible when explicitly enabled
-        log.trace("Scheduler tick complete at {}", Instant.now());
     }
 }
