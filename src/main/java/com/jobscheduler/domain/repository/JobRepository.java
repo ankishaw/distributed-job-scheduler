@@ -8,37 +8,18 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
-import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
-/**
- * Data access for the jobs table.
- *
- * The two most important queries are:
- *   1. claimPendingJobs  — SKIP LOCKED for parallel, contention-free claiming
- *   2. findDueJobs       — scheduler loop uses this to fill the Redis queue
- *
- * Both must be called from inside a @Transactional method.
- */
-@Repository
 public interface JobRepository extends JpaRepository<Job, UUID> {
 
-    // ── Worker: claim jobs from Postgres (Phase 1 — pre-Redis) ───────────────
-
     /**
-     * Atomically claim up to {@code limit} PENDING jobs, skipping any row
-     * currently locked by another transaction (SKIP LOCKED).
-     *
-     * The calling service MUST update status → RUNNING within the same
-     * @Transactional boundary before the method returns. If it doesn't,
-     * the lock is released on commit and another worker can claim the same rows.
-     *
-     * ORDER BY priority DESC, created_at ASC ensures CRITICAL jobs dispatch first,
-     * with FIFO ordering within the same priority level.
+     * SKIP LOCKED — claim up to `limit` PENDING jobs due now.
+     * Atomically locks rows; other workers skip locked rows instantly.
+     * Primary dispatch mechanism when Redis is unavailable.
      */
     @Query(value = """
             SELECT * FROM jobs
@@ -48,37 +29,58 @@ public interface JobRepository extends JpaRepository<Job, UUID> {
             LIMIT  :limit
             FOR UPDATE SKIP LOCKED
             """, nativeQuery = true)
-    List<Job> claimPendingJobs(
-            @Param("now")   Instant now,
-            @Param("limit") int limit
-    );
-
-    // ── Scheduler: find jobs to enqueue into Redis ────────────────────────────
+    List<Job> claimPendingJobs(@Param("now") Instant now,
+                               @Param("limit") int limit);
 
     /**
-     * Find PENDING jobs whose next_run_at is in the past.
-     * Used by SchedulerLoop to populate the Redis work queue.
-     * Pageable controls the batch size (dispatchBatchSize from AppProperties).
+     * Atomically mark a job as RUNNING.
+     * Used by the Redis queue claim path to prevent double-claiming.
+     * Returns 1 if updated (success), 0 if already claimed by another worker.
+     */
+    @Modifying
+    @Transactional
+    @Query(value = """
+            UPDATE jobs
+            SET    status    = :status,
+                   worker_id = :workerId,
+                   updated_at = now()
+            WHERE  id     = :jobId
+            AND    status = 'PENDING'
+            """, nativeQuery = true)
+    int markJobRunning(@Param("jobId") UUID jobId,
+                       @Param("workerId") String workerId,
+                       @Param("status") String status);
+
+    /**
+     * Find COMPLETED cron jobs to reschedule.
+     * SchedulerLoop calls this every tick.
      */
     @Query("""
             SELECT j FROM Job j
-            WHERE  j.status = :status
-            AND    j.nextRunAt <= :now
-            ORDER  BY j.priority DESC, j.createdAt ASC
+            WHERE  j.status = 'COMPLETED'
+            AND    j.cronExpression IS NOT NULL
+            ORDER  BY j.updatedAt ASC
             """)
-    Page<Job> findDueJobs(
-            @Param("status") JobStatus status,
-            @Param("now")    Instant now,
-            Pageable pageable
-    );
-
-    // ── Stale job reclaim ─────────────────────────────────────────────────────
+    Page<Job> findCompletedCronJobs(Pageable pageable);
 
     /**
-     * Move all RUNNING jobs owned by a dead worker back to PENDING.
-     * Called by StaleJobReclaimer after confirming the worker's heartbeat has expired.
-     *
-     * Returns the number of rows updated (useful for metrics).
+     * Anti-starvation: bump priority for long-waiting jobs.
+     */
+    @Modifying
+    @Transactional
+    @Query(value = """
+            UPDATE jobs
+            SET    priority   = LEAST(priority + 1, 4),
+                   updated_at = now()
+            WHERE  status     = 'PENDING'
+            AND    next_run_at < :waitingBefore
+            AND    priority   < 4
+            """, nativeQuery = true)
+    int promoteStalePendingJobs(@Param("waitingBefore") Instant waitingBefore);
+
+    /**
+     * Reclaim RUNNING jobs from a dead worker back to PENDING.
+     * Called by HeartbeatAndReclaimService when a worker's last_seen is stale.
      */
     @Modifying
     @Transactional
@@ -92,42 +94,5 @@ public interface JobRepository extends JpaRepository<Job, UUID> {
             """, nativeQuery = true)
     int reclaimJobsForWorker(@Param("workerId") String workerId);
 
-    // ── Admin / API queries ───────────────────────────────────────────────────
-
-    /** Paginated listing with optional status filter — used by GET /jobs. */
     Page<Job> findByStatusIn(List<JobStatus> statuses, Pageable pageable);
-
-    /** All jobs in any state — for admin dashboards. */
-    Page<Job> findAll(Pageable pageable);
-
-    /**
-     * Find completed recurring (cron) jobs that need rescheduling.
-     * SchedulerLoop calls this every tick to compute and set the next run time.
-     */
-    @Query("""
-            SELECT j FROM Job j
-            WHERE  j.status = 'COMPLETED'
-            AND    j.cronExpression IS NOT NULL
-            ORDER  BY j.updatedAt ASC
-            """)
-    Page<Job> findCompletedCronJobs(Pageable pageable);
-
-    /**
-     * Anti-starvation: age-based priority promotion.
-     * Bumps priority by 1 (capped at CRITICAL=4) for PENDING jobs
-     * that have been waiting longer than the given threshold.
-     *
-     * Call this from a @Scheduled method every 5 minutes.
-     */
-    @Modifying
-    @Transactional
-    @Query(value = """
-            UPDATE jobs
-            SET    priority   = LEAST(priority + 1, 4),
-                   updated_at = now()
-            WHERE  status     = 'PENDING'
-            AND    next_run_at < :waitingBefore
-            AND    priority   < 4
-            """, nativeQuery = true)
-    int promoteStalePendingJobs(@Param("waitingBefore") Instant waitingBefore);
 }

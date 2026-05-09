@@ -7,11 +7,16 @@ import com.jobscheduler.domain.model.Job;
 import com.jobscheduler.domain.model.JobStatus;
 import com.jobscheduler.domain.repository.JobRepository;
 import com.jobscheduler.metrics.JobMetrics;
+import com.jobscheduler.queue.RedisJobQueue;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.scheduling.support.CronExpression;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronizationAdapter;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Instant;
 import java.time.ZonedDateTime;
@@ -22,12 +27,18 @@ import java.util.UUID;
 @Transactional
 public class JobService {
 
-    private final JobRepository jobRepository;
-    private final JobMetrics jobMetrics;
+    private static final Logger log = LoggerFactory.getLogger(JobService.class);
 
-    public JobService(JobRepository jobRepository, JobMetrics jobMetrics) {
+    private final JobRepository jobRepository;
+    private final JobMetrics    jobMetrics;
+    private final RedisJobQueue redisJobQueue;
+
+    public JobService(JobRepository jobRepository,
+                      JobMetrics jobMetrics,
+                      RedisJobQueue redisJobQueue) {
         this.jobRepository = jobRepository;
         this.jobMetrics    = jobMetrics;
+        this.redisJobQueue = redisJobQueue;
     }
 
     public JobResponse createJob(CreateJobRequest req) {
@@ -55,6 +66,27 @@ public class JobService {
         }
 
         Job saved = jobRepository.save(job);
+
+        // Push to Redis AFTER transaction commits.
+        // Workers block on Redis — if we push during the transaction,
+        // the job isn't visible in Postgres yet when they try to claim it.
+        // afterCommit() guarantees Postgres write is visible before Redis push.
+        if (!saved.getNextRunAt().isAfter(Instant.now())) {
+            UUID savedId = saved.getId();
+            TransactionSynchronizationManager.registerSynchronization(
+                    new TransactionSynchronizationAdapter() {
+                        @Override
+                        public void afterCommit() {
+                            boolean pushed = redisJobQueue.push(savedId);
+                            if (!pushed) {
+                                log.warn("Redis push failed — job {} will use SKIP LOCKED fallback",
+                                        savedId);
+                            }
+                        }
+                    }
+            );
+        }
+
         jobMetrics.recordSubmit(saved.getJobType(), req.getPriority());
         return JobResponse.from(saved);
     }
@@ -75,8 +107,7 @@ public class JobService {
     public JobResponse cancelJob(UUID id) {
         Job job = findOrThrow(id);
         job.transitionTo(JobStatus.CANCELLED);
-        Job saved = jobRepository.save(job);
-        return JobResponse.from(saved);
+        return JobResponse.from(jobRepository.save(job));
     }
 
     private Job findOrThrow(UUID id) {
@@ -91,7 +122,7 @@ public class JobService {
             if (next == null) throw new IllegalArgumentException("No future execution: " + expression);
             return next.toInstant();
         } catch (IllegalArgumentException e) {
-            throw new IllegalArgumentException("Invalid cron expression: " + expression + " — " + e.getMessage());
+            throw new IllegalArgumentException("Invalid cron: " + expression + " — " + e.getMessage());
         }
     }
 }
