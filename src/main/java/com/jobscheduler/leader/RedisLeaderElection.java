@@ -114,14 +114,22 @@ public class RedisLeaderElection implements LeaderElection {
         return leader.get();
     }
 
+//    @Override
+//    public String getLeaderNodeId() {
+//        try {
+//            String current = bucket.get();
+//            return current != null ? current : "none";
+//        } catch (Exception e) {
+//            return "unknown";
+//        }
+//    }
     @Override
     public String getLeaderNodeId() {
-        try {
-            String current = bucket.get();
-            return current != null ? current : "none";
-        } catch (Exception e) {
-            return "unknown";
-        }
+        // If we ARE the leader, we know our own nodeId — no Redis read needed
+        // Redis read has codec issues and isn't needed for this simple case
+        if (leader.get()) return nodeId;
+        // If we're not leader, we don't know who is — return unknown
+        return "unknown";
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────

@@ -1,0 +1,8 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/jobscheduler
+    username: postgres
+    password: secret
+  redis:
+    host: localhost
+    port: 6379
